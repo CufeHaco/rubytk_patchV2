@@ -2,7 +2,7 @@
 # Tk_Installer.rb by CufeHaco
 # Installs and patches Ruby/Tk for Ruby 2.4+ with Tcl/Tk 8.6 (dynamic detection)
 # Repurposed from RubianFileUtils::DynamicUtils
-# Updated August 14, 2025 for tk gem 0.5.1 with separate paths and last-ditch find glob
+# Updated August 14, 2025 for tk gem 0.5.1 with sudo for gem install and error-only cleanup
 # https://github.com/CufeHaco/Tk_Patch
 
 require 'rbconfig'
@@ -228,14 +228,18 @@ EOF`.strip
       log 'Installing tk gem (version 0.5.1)'
       case @os
       when /linux/
-        system "gem install tk -- --with-tcltkversion=#{@tcltk_version} " \
-               "--with-tcl-lib=#{@tcl_lib_path} " \
-               "--with-tk-lib=#{@tk_lib_path} " \
-               "--with-tcl-include=#{@tcl_include_path} " \
-               "--with-tk-include=#{@tk_include_path} " \
-               "--enable-pthread" or log 'Failed to install tk gem' and cleanup_and_exit(1)
+        cmd = "sudo gem install tk -- --with-tcltkversion=#{@tcltk_version} " \
+              "--with-tcl-lib=#{@tcl_lib_path} " \
+              "--with-tk-lib=#{@tk_lib_path} " \
+              "--with-tcl-include=#{@tcl_include_path} " \
+              "--with-tk-include=#{@tk_include_path} " \
+              "--enable-pthread"
+        unless system(cmd)
+          log "Failed to install tk gem. Output: #{$?.inspect}"
+          cleanup_and_exit(1)
+        end
       when /darwin/
-        system "gem install tk -- --with-tcl-dir=#{@tcl_lib_path} " \
+        system "sudo gem install tk -- --with-tcl-dir=#{@tcl_lib_path} " \
                "--with-tk-dir=#{@tk_lib_path} " \
                "--with-tcllib=tcl#{@tcltk_version.gsub('.', '')} --with-tklib=tk#{@tcltk_version.gsub('.', '')}" or log 'Failed to install tk gem' and cleanup_and_exit(1)
       when /mswin|mingw/
@@ -289,8 +293,13 @@ EOF`.strip
       detect_tcltk
       create_symlinks
       install_tk_gem
-      test_tk
-      log "Tk Installer completed successfully at #{Time.now}"
+      begin
+        test_tk
+        log "Tk Installer completed successfully at #{Time.now}"
+      rescue StandardError
+        log "Installation failed during test phase. Initiating cleanup..."
+        cleanup_and_exit(1)
+      end
     end
   end
 end
