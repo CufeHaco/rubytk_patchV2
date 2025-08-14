@@ -2,7 +2,7 @@
 # Tk_Installer.rb by CufeHaco
 # Installs and patches Ruby/Tk for Ruby 2.4+ with Tcl/Tk 8.6 (dynamic detection)
 # Repurposed from RubianFileUtils::DynamicUtils
-# Updated August 14, 2025 for tk gem 0.5.1 with improved glob detection for Tcl/Tk 8.6
+# Updated August 14, 2025 for tk gem 0.5.1 with separate paths and last-ditch find glob
 # https://github.com/CufeHaco/Tk_Patch
 
 require 'rbconfig'
@@ -14,8 +14,12 @@ module TkInstaller
       @os = RbConfig::CONFIG['host_os']
       @tcltk_version = nil
       @supported_version = '8.6'
-      @tcl_path = nil
-      @tk_path = nil
+      @tcl_config_path = nil
+      @tk_config_path = nil
+      @tcl_lib_path = nil
+      @tk_lib_path = nil
+      @tcl_include_path = nil
+      @tk_include_path = nil
       @log_file = 'tk_installer.log'
       @temp_log = 'tmp_apt_output'
       log "Starting Tk Installer at #{Time.now} on #{@os}"
@@ -26,31 +30,50 @@ module TkInstaller
       puts message
     end
 
-    # Enhanced glob detection with recursive pattern matching and debugging
+    # Enhanced with recursive pattern matching and last-ditch find command
     def find_tcltk(file, search_paths)
       matches = search_paths.flat_map { |path| Dir.glob("#{path}/**/#{file}", File::FNM_CASEFOLD) } # Case-insensitive recursive glob
-      log "Glob matches for #{file}: #{matches.inspect}" # Debug all matches
+      log "Glob matches for #{file}: #{matches.inspect}"
       if matches.empty?
-        log "No initial matches for #{file} in #{search_paths}. Falling back to full system search..."
-        matches = Dir.glob("/usr/**/#{file}", File::FNM_CASEFOLD) # Broader recursive search
-        log "Full system matches for #{file}: #{matches.inspect}"
+        log "No initial matches for #{file} in #{search_paths}. Falling back to full /usr glob..."
+        matches = Dir.glob("/usr/**/#{file}", File::FNM_CASEFOLD)
+        log "Full /usr glob matches for #{file}: #{matches.inspect}"
+      end
+
+      if matches.empty?
+        log "No matches in full glob. Performing last-ditch system find for #{file}..."
+        system("find /usr -name '#{file}' 2>/dev/null > #{@temp_log}")
+        matches = File.read(@temp_log).lines.map(&:chomp)
+        log "Last-ditch find matches for #{file}: #{matches.inspect}"
+        File.delete(@temp_log) if File.exist?(@temp_log)
       end
 
       file_found = false
       matches.each_with_index do |found_path, index|
         next unless File.exist?(found_path)
-        # Broader pattern matching for versioned directories (e.g., 8.6, 8.6.13)
         if found_path.match?(/#{@tcltk_version || @supported_version}\.?\d*/i)
-          @tcl_path = File.dirname(found_path) if file.include?('tcl')
-          @tk_path = File.dirname(found_path) if file.include?('tk')
-          log "Found #{file} at: #{found_path} (index #{index} in glob array)"
+          case file
+          when "tclConfig.sh"
+            @tcl_config_path = File.dirname(found_path)
+          when "tkConfig.sh"
+            @tk_config_path = File.dirname(found_path)
+          when "libtcl#{@tcltk_version}.so"
+            @tcl_lib_path = File.dirname(found_path)
+          when "libtk#{@tcltk_version}.so"
+            @tk_lib_path = File.dirname(found_path)
+          when "tcl.h"
+            @tcl_include_path = File.dirname(found_path)
+          when "tk.h"
+            @tk_include_path = File.dirname(found_path)
+          end
+          log "Found #{file} at: #{found_path} (index #{index} in matches array)"
           file_found = true
-          break # Use the first matching path
+          break
         end
       end
 
       unless file_found
-        log "File not found: #{file}. No versioned match in glob array: #{matches.inspect}"
+        log "File not found: #{file}. No versioned match in matches array: #{matches.inspect}"
         return false
       end
       true
@@ -112,7 +135,8 @@ EOF`.strip
       when /mswin|mingw/
         log 'Please install ActiveTcl 8.6 from https://www.activestate.com/products/activetcl.'
         exit 1 unless Dir.exist?('C:/ActiveTcl')
-        @tcl_path = @tk_path = 'C:/ActiveTcl'
+        @tcl_config_path = @tcl_lib_path = @tcl_include_path = 'C:/ActiveTcl'
+        @tk_config_path = @tk_lib_path = @tk_include_path = 'C:/ActiveTcl'
       else
         log "Unsupported OS: #{@os}. Please install Tcl/Tk #{@supported_version} manually."
         cleanup_and_exit(1)
@@ -148,7 +172,7 @@ EOF`.strip
 
       search_paths = case @os
                      when /linux/
-                       ["/usr/lib", "/usr/lib/aarch64-linux-gnu", "/usr/lib/arm-linux-gnueabihf", "/usr/local/lib", "/usr/include", "/usr/include/tcl#{@tcltk_version}", "/usr/include/tk#{@tcltk_version}", "/usr/share/tcltk"]
+                       ["/usr/lib", "/usr/lib/#{`uname -m`.strip}", "/usr/lib/aarch64-linux-gnu", "/usr/lib/aarch64-linux-gnu/tcl#{@tcltk_version}", "/usr/lib/aarch64-linux-gnu/tk#{@tcltk_version}", "/usr/local/lib", "/usr/include", "/usr/include/tcl#{@tcltk_version}", "/usr/include/tk#{@tcltk_version}", "/usr/share/tcltk", "/usr/share/tcltk/tcl#{@tcltk_version}", "/usr/share/tcltk/tk#{@tcltk_version}"]
                      when /darwin/
                        ["/opt/homebrew/Cellar/tcl-tk@#{@tcltk_version}", "/usr/local/Cellar/tcl-tk", "/Library/Frameworks"]
                      when /mswin|mingw/
@@ -156,7 +180,7 @@ EOF`.strip
                      else
                        []
                      end
-      tcltk_files = ["tclConfig.sh", "tkConfig.sh", "libtcl#{@tcltk_version}.so", "libtk#{@tcltk_version}.so", "tcl.h"]
+      tcltk_files = ["tclConfig.sh", "tkConfig.sh", "libtcl#{@tcltk_version}.so", "libtk#{@tcltk_version}.so", "tcl.h", "tk.h"]
       found_all = tcltk_files.all? { |file| find_tcltk(file, search_paths) }
       unless found_all
         log 'Error: Some Tcl/Tk files not found after detection/installation.'
@@ -183,10 +207,10 @@ EOF`.strip
       return unless @os =~ /linux/
       log "Creating symlinks for Tcl/Tk #{@tcltk_version}"
       symlinks = [
-        ["#{@tcl_path}/tclConfig.sh", '/usr/lib/tclConfig.sh'],
-        ["#{@tk_path}/tkConfig.sh", '/usr/lib/tkConfig.sh'],
-        ["#{@tcl_path}/libtcl#{@tcltk_version}.so.0", "/usr/lib/libtcl#{@tcltk_version}.so.0"],
-        ["#{@tk_path}/libtk#{@tcltk_version}.so.0", "/usr/lib/libtk#{@tcltk_version}.so.0"]
+        ["#{@tcl_config_path}/tclConfig.sh", '/usr/lib/tclConfig.sh'],
+        ["#{@tk_config_path}/tkConfig.sh", '/usr/lib/tkConfig.sh'],
+        ["#{@tcl_lib_path}/libtcl#{@tcltk_version}.so.0", "/usr/lib/libtcl#{@tcltk_version}.so.0"],
+        ["#{@tk_lib_path}/libtk#{@tcltk_version}.so.0", "/usr/lib/libtk#{@tcltk_version}.so.0"]
       ]
       symlinks.each do |src, dest|
         if File.exist?(src) && !File.exist?(dest)
@@ -205,17 +229,17 @@ EOF`.strip
       case @os
       when /linux/
         system "gem install tk -- --with-tcltkversion=#{@tcltk_version} " \
-               "--with-tcl-lib=#{@tcl_path} " \
-               "--with-tk-lib=#{@tk_path} " \
-               "--with-tcl-include=/usr/include/tcl#{@tcltk_version} " \
-               "--with-tk-include=/usr/include/tk#{@tcltk_version} " \
+               "--with-tcl-lib=#{@tcl_lib_path} " \
+               "--with-tk-lib=#{@tk_lib_path} " \
+               "--with-tcl-include=#{@tcl_include_path} " \
+               "--with-tk-include=#{@tk_include_path} " \
                "--enable-pthread" or log 'Failed to install tk gem' and cleanup_and_exit(1)
       when /darwin/
-        system "gem install tk -- --with-tcl-dir=#{@tcl_path} " \
-               "--with-tk-dir=#{@tk_path} " \
+        system "gem install tk -- --with-tcl-dir=#{@tcl_lib_path} " \
+               "--with-tk-dir=#{@tk_lib_path} " \
                "--with-tcllib=tcl#{@tcltk_version.gsub('.', '')} --with-tklib=tk#{@tcltk_version.gsub('.', '')}" or log 'Failed to install tk gem' and cleanup_and_exit(1)
       when /mswin|mingw/
-        system "gem install tk -- --with-tcl-dir=#{@tcl_path} --with-tk-dir=#{@tk_path}" or
+        system "gem install tk -- --with-tcl-dir=#{@tcl_lib_path} --with-tk-dir=#{@tk_lib_path}" or
           log 'Failed to install tk gem' and cleanup_and_exit(1)
       end
     end
