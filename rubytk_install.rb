@@ -2,7 +2,7 @@
 # Tk_Installer.rb by CufeHaco
 # Installs and patches Ruby/Tk for Ruby 2.4+ with Tcl/Tk 8.6 (dynamic detection)
 # Repurposed from RubianFileUtils::DynamicUtils
-# Updated August 14, 2025 for tk gem 0.5.1 with recursive pattern matching in find_tcltk
+# Updated August 14, 2025 for tk gem 0.5.1 with improved glob detection for Tcl/Tk 8.6
 # https://github.com/CufeHaco/Tk_Patch
 
 require 'rbconfig'
@@ -26,17 +26,21 @@ module TkInstaller
       puts message
     end
 
-    # Enhanced with user's suggestion: recursive pattern matching via each_with_index on glob array
+    # Enhanced glob detection with recursive pattern matching and debugging
     def find_tcltk(file, search_paths)
       matches = search_paths.flat_map { |path| Dir.glob("#{path}/**/#{file}", File::FNM_CASEFOLD) } # Case-insensitive recursive glob
+      log "Glob matches for #{file}: #{matches.inspect}" # Debug all matches
       if matches.empty?
-        log "No matches found for #{file} in #{search_paths}. Falling back to broader search..."
-        matches = Dir.glob("/usr/**/#{file}", File::FNM_CASEFOLD) # Broader recursive search if initial fails
+        log "No initial matches for #{file} in #{search_paths}. Falling back to full system search..."
+        matches = Dir.glob("/usr/**/#{file}", File::FNM_CASEFOLD) # Broader recursive search
+        log "Full system matches for #{file}: #{matches.inspect}"
       end
 
       file_found = false
       matches.each_with_index do |found_path, index|
-        if File.exist?(found_path) && found_path.match?(/#{@tcltk_version || @supported_version}/i) # Pattern matching for version
+        next unless File.exist?(found_path)
+        # Broader pattern matching for versioned directories (e.g., 8.6, 8.6.13)
+        if found_path.match?(/#{@tcltk_version || @supported_version}\.?\d*/i)
           @tcl_path = File.dirname(found_path) if file.include?('tcl')
           @tk_path = File.dirname(found_path) if file.include?('tk')
           log "Found #{file} at: #{found_path} (index #{index} in glob array)"
@@ -46,7 +50,7 @@ module TkInstaller
       end
 
       unless file_found
-        log "File not found: #{file}. Glob array: #{matches.inspect}"
+        log "File not found: #{file}. No versioned match in glob array: #{matches.inspect}"
         return false
       end
       true
@@ -144,7 +148,7 @@ EOF`.strip
 
       search_paths = case @os
                      when /linux/
-                       ["/usr/lib", "/usr/lib/#{`uname -m`.strip}", "/usr/local/lib", "/usr/include", "/usr/include/tcl#{@tcltk_version}", "/usr/include/tk#{@tcltk_version}", "/usr/share/tcltk/tcl#{@tcltk_version}", "/usr/share/tcltk/tk#{@tcltk_version}"]
+                       ["/usr/lib", "/usr/lib/aarch64-linux-gnu", "/usr/lib/arm-linux-gnueabihf", "/usr/local/lib", "/usr/include", "/usr/include/tcl#{@tcltk_version}", "/usr/include/tk#{@tcltk_version}", "/usr/share/tcltk"]
                      when /darwin/
                        ["/opt/homebrew/Cellar/tcl-tk@#{@tcltk_version}", "/usr/local/Cellar/tcl-tk", "/Library/Frameworks"]
                      when /mswin|mingw/
@@ -204,7 +208,7 @@ EOF`.strip
                "--with-tcl-lib=#{@tcl_path} " \
                "--with-tk-lib=#{@tk_path} " \
                "--with-tcl-include=/usr/include/tcl#{@tcltk_version} " \
-               "--with-tk-include=/usr/include/tcl#{@tcltk_version} " \
+               "--with-tk-include=/usr/include/tk#{@tcltk_version} " \
                "--enable-pthread" or log 'Failed to install tk gem' and cleanup_and_exit(1)
       when /darwin/
         system "gem install tk -- --with-tcl-dir=#{@tcl_path} " \
@@ -241,7 +245,7 @@ EOF`.strip
       case @os
       when /linux/
         log 'Removing installed Tcl/Tk and Ruby packages...'
-        system "sudo apt-get remove -y ruby-all-dev tcl#{@supported_version}-dev tk#{@supported_version}-dev libbrotli-dev libfontconfig-dev libfreetype-dev libpng-dev libxrender-dev libxft-dev libxss-dev > #{@temp_log} 2>&1"
+        system "sudo apt-get remove -y ruby-all-dev tcl#{@supported_version}-dev tk#{@supported_version}-dev libx11-dev libbrotli-dev libfontconfig-dev libfreetype-dev libpng-dev libxrender-dev libxft-dev libxss-dev > #{@temp_log} 2>&1"
         system "sudo apt-get autoremove -y --purge > #{@temp_log} 2>&1"
         system "sudo rm -f /usr/lib/tclConfig.sh /usr/lib/tkConfig.sh /usr/lib/libtcl#{@supported_version}.so.0 /usr/lib/libtk#{@supported_version}.so.0"
         log "Cleanup output: #{File.read(@temp_log)}" if File.exist?(@temp_log)
