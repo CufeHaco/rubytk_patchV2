@@ -2,7 +2,7 @@
 # Tk_Installer.rb by CufeHaco
 # Installs and patches Ruby/Tk for Ruby 2.4+ with Tcl/Tk 8.6 (dynamic detection)
 # Repurposed from RubianFileUtils::DynamicUtils
-# Updated August 14, 2025 for tk gem 0.5.1 with nil check fix, PATH update, and retry logic
+# Updated August 14, 2025 for tk gem 0.5.1 with recursive pattern matching in find_tcltk
 # https://github.com/CufeHaco/Tk_Patch
 
 require 'rbconfig'
@@ -26,29 +26,32 @@ module TkInstaller
       puts message
     end
 
-    # Adapted from rubian_boot to find Tcl/Tk files dynamically based on version
+    # Enhanced with user's suggestion: recursive pattern matching via each_with_index on glob array
     def find_tcltk(file, search_paths)
-      file_found = false
-      search_paths.each do |path|
-        Dir.glob("#{path}/**/#{file}").each do |found_path|
-          if File.exist?(found_path)
-            @tcl_path = File.dirname(found_path) unless @tcl_path
-            @tk_path = File.dirname(found_path) unless @tk_path
-            log "Found #{file} at: #{found_path}"
-            file_found = true
-            break
-          end
-        end
-        break if file_found
+      matches = search_paths.flat_map { |path| Dir.glob("#{path}/**/#{file}", File::FNM_CASEFOLD) } # Case-insensitive recursive glob
+      if matches.empty?
+        log "No matches found for #{file} in #{search_paths}. Falling back to broader search..."
+        matches = Dir.glob("/usr/**/#{file}", File::FNM_CASEFOLD) # Broader recursive search if initial fails
       end
+
+      file_found = false
+      matches.each_with_index do |found_path, index|
+        if File.exist?(found_path) && found_path.match?(/#{@tcltk_version || @supported_version}/i) # Pattern matching for version
+          @tcl_path = File.dirname(found_path) if file.include?('tcl')
+          @tk_path = File.dirname(found_path) if file.include?('tk')
+          log "Found #{file} at: #{found_path} (index #{index} in glob array)"
+          file_found = true
+          break # Use the first matching path
+        end
+      end
+
       unless file_found
-        log "File not found: #{file}"
+        log "File not found: #{file}. Glob array: #{matches.inspect}"
         return false
       end
       true
     end
 
-    # Dynamic introspection to get Tcl/Tk version via tclsh
     def get_tcltk_version
       if system('which tclsh > /dev/null 2>&1')
         version = `tclsh <<EOF
@@ -58,7 +61,6 @@ EOF`.strip
         version
       else
         log "No tclsh found; Tcl/Tk not detected. Updating PATH..."
-        # Update PATH to include newly installed tclsh
         system('export PATH=$PATH:/usr/bin') unless @os =~ /mswin|mingw/
         nil
       end
@@ -74,6 +76,9 @@ EOF`.strip
         log 'Error: sudo required for Linux/macOS. Please run as a user with sudo privileges.'
         cleanup_and_exit(1)
       end
+      if @os =~ /linux/ && !system('which X > /dev/null 2>&1')
+        log 'Warning: X11 not found. Tk requires a graphical environment. Install with: sudo apt-get install xorg'
+      end
     end
 
     def install_dependencies
@@ -82,7 +87,7 @@ EOF`.strip
       when /linux/
         system 'sudo apt-get update'
         log 'Updating package lists... (1/3)'
-        cmd = "sudo apt-get install -y ruby-all-dev tcl#{@supported_version}-dev tk#{@supported_version}-dev > #{@temp_log} 2>&1"
+        cmd = "sudo apt-get install -y ruby-all-dev tcl#{@supported_version}-dev tk#{@supported_version}-dev libx11-dev > #{@temp_log} 2>&1"
         unless system(cmd)
           log "Installation failed. Output: #{File.read(@temp_log)}"
           File.delete(@temp_log) if File.exist?(@temp_log)
@@ -90,7 +95,6 @@ EOF`.strip
         end
         log 'Installing development packages... (2/3)'
         log 'Finalizing installation... (3/3)'
-        # Update PATH after installation
         system('export PATH=$PATH:/usr/bin') unless ENV['PATH'].include?('/usr/bin')
       when /darwin/
         if system('brew --version > /dev/null 2>&1')
@@ -109,7 +113,6 @@ EOF`.strip
         log "Unsupported OS: #{@os}. Please install Tcl/Tk #{@supported_version} manually."
         cleanup_and_exit(1)
       end
-      # After installation, set version dynamically
       @tcltk_version = get_tcltk_version&.split('.')&.slice(0..1)&.join('.') || @supported_version
     end
 
@@ -141,7 +144,7 @@ EOF`.strip
 
       search_paths = case @os
                      when /linux/
-                       ["/usr/lib", "/usr/lib/#{`uname -m`.strip}", "/usr/local/lib"]
+                       ["/usr/lib", "/usr/lib/#{`uname -m`.strip}", "/usr/local/lib", "/usr/include", "/usr/include/tcl#{@tcltk_version}", "/usr/include/tk#{@tcltk_version}", "/usr/share/tcltk/tcl#{@tcltk_version}", "/usr/share/tcltk/tk#{@tcltk_version}"]
                      when /darwin/
                        ["/opt/homebrew/Cellar/tcl-tk@#{@tcltk_version}", "/usr/local/Cellar/tcl-tk", "/Library/Frameworks"]
                      when /mswin|mingw/
