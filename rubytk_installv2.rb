@@ -57,76 +57,65 @@ module TkInstaller
     end
 
     # ── File detection ─────────────────────────────────────────────────────────
-    # glob → match → dispatch  (Kestówv pattern)
-    #
-    # One pass over /usr. All six target files resolved simultaneously.
-    # Each found path is tested against a dispatch table — the first versioned
-    # match for each slot wins and the ivar is set. No repeated syscalls.
-    #
-    # Dispatch table maps a match pattern → the ivar it populates.
-    # Truth match: path must contain the version string (dir-level match for
-    # config files whose names carry no version themselves).
-
-    TCLTK_TARGETS = {
-      /tclConfig\.sh$/i   => :@tcl_config_path,
-      /tkConfig\.sh$/i    => :@tk_config_path,
-      /libtcl.*\.so/i     => :@tcl_lib_path,
-      /libtk.*\.so/i      => :@tk_lib_path,
-      /\/tcl\.h$/i        => :@tcl_include_path,
-      /\/tk\.h$/i         => :@tk_include_path,
-    }.freeze
+    # Rubian boot pattern: glob all → select by filename → assign dir.
+    # One candidate pool. Six selects. No complex regex on paths.
+    # search_paths already scope to version dirs — version filter is just
+    # p.include?(ver) on the full path string, which catches both
+    # /usr/lib/tcl8.6/tclConfig.sh AND /usr/lib/x86_64-linux-gnu/libtcl8.6.so
 
     def detect_tcltk_files(search_paths)
-      ver     = @tcltk_version || SUPPORTED_VERSION
-      ver_re  = /#{Regexp.escape(ver)}/
+      ver = @tcltk_version || SUPPORTED_VERSION
 
-      # Tier 1 — targeted glob across known paths
-      candidates = search_paths.flat_map { |p| Dir.glob("#{p}/**/*", File::FNM_CASEFOLD) }.uniq
+      # Glob all files under the scoped search paths in one pass
+      all_files = search_paths
+                    .select  { |p| Dir.exist?(p) }
+                    .flat_map { |p| Dir.glob("#{p}/**/*") }
+                    .select  { |p| File.file?(p) }
+                    .uniq
 
-      # Tier 2 — full /usr sweep if tier 1 came up short
-      if candidates.empty?
-        log "Tier 1 empty — falling back to full /usr glob..."
-        candidates = Dir.glob("/usr/**/*", File::FNM_CASEFOLD).uniq
+      # Tier 2 — widen to all of /usr if scoped glob missed everything
+      if all_files.empty?
+        log "Scoped glob empty — widening to /usr..."
+        all_files = Dir.glob("/usr/**/*").select { |p| File.file?(p) }.uniq
       end
 
-      # Tier 3 — system find as last resort
-      if candidates.empty?
-        log "Tier 2 empty — running system find /usr..."
-        candidates = `find /usr -type f 2>/dev/null`.lines.map(&:chomp).reject(&:empty?)
+      # Tier 3 — system find as absolute last resort
+      if all_files.empty?
+        log "Wide glob empty — running system find /usr..."
+        all_files = `find /usr -type f 2>/dev/null`.lines.map(&:chomp).reject(&:empty?)
       end
 
-      log "Candidate pool: #{candidates.size} paths"
+      log "Candidate pool: #{all_files.size} paths"
 
-      # Single match pass — glob → match → dispatch
-      # Each candidate is tested against every unresolved slot in the table.
-      unresolved = TCLTK_TARGETS.keys.to_a
+      # Split into versioned and unversioned pools.
+      # Headers (tcl.h / tk.h) have no version in path so use the full pool.
+      versioned = all_files.select { |p| p.include?(ver) }
 
-      candidates.each do |path|
-        next unless File.exist?(path)
-        next unless (path + File.dirname(path)).match?(ver_re)   # truth match: version present
+      @tcl_config_path  ||= versioned.select { |p| File.basename(p) == "tclConfig.sh"          }.first&.then { |p| File.dirname(p) }
+      @tk_config_path   ||= versioned.select { |p| File.basename(p) == "tkConfig.sh"           }.first&.then { |p| File.dirname(p) }
+      @tcl_lib_path     ||= versioned.select { |p| File.basename(p).match?(/\Alibtcl.*\.so/)   }.first&.then { |p| File.dirname(p) }
+      @tk_lib_path      ||= versioned.select { |p| File.basename(p).match?(/\Alibtk.*\.so/)    }.first&.then { |p| File.dirname(p) }
+      @tcl_include_path ||= all_files.select { |p| File.basename(p) == "tcl.h"                 }.first&.then { |p| File.dirname(p) }
+      @tk_include_path  ||= all_files.select { |p| File.basename(p) == "tk.h"                  }.first&.then { |p| File.dirname(p) }
 
-        unresolved.delete_if do |pattern|
-          next false unless path.match?(pattern)
-          ivar = TCLTK_TARGETS[pattern]
-          next false if instance_variable_get(ivar)              # already resolved, skip
-          instance_variable_set(ivar, File.dirname(path))
-          log "Resolved #{ivar} → #{path}"
-          true                                                    # remove from unresolved
-        end
+      { tcl_config: @tcl_config_path, tk_config: @tk_config_path,
+        tcl_lib:    @tcl_lib_path,    tk_lib:    @tk_lib_path,
+        tcl_inc:    @tcl_include_path, tk_inc:   @tk_include_path
+      }.each { |k, v| log "  #{k}: #{v || 'UNRESOLVED'}" }
 
-        break if unresolved.empty?                               # all slots filled, stop early
-      end
+      missing = [@tcl_config_path, @tk_config_path, @tcl_lib_path,
+                 @tk_lib_path, @tcl_include_path, @tk_include_path].count(&:nil?)
 
-      missing = TCLTK_TARGETS.values.select { |v| instance_variable_get(v).nil? }
-      if missing.any?
-        log "ERROR: Unresolved Tcl/Tk slots: #{missing.inspect}"
-        log "  Run: dpkg -L tcl#{SUPPORTED_VERSION}-dev tk#{SUPPORTED_VERSION}-dev"
+      if missing > 0
+        log "ERROR: #{missing} Tcl/Tk path(s) unresolved."
+        log "  Run: dpkg -L tcl#{ver}-dev tk#{ver}-dev"
         log "  Run: find /usr -name tclConfig.sh 2>/dev/null"
         return false
       end
 
       true
     end
+
 
     # ── Tcl/Tk version detection ───────────────────────────────────────────────
 
