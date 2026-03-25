@@ -103,6 +103,14 @@ module TkInstaller
       result.empty? ? nil : result
     end
 
+    # Extract version from pkg-config — sets @version if not already set
+    def pkgconfig_version
+      ver = `pkg-config --modversion tcl 2>/dev/null`.strip
+      return if ver.empty?
+      @version = ver.split('.')[0..1].join('.')
+      log "Version from pkg-config: #{@version}"
+    end
+
     # Full filesystem find — last resort, no path hints
     def filesystem_find(filename)
       log "Filesystem search for #{filename}..."
@@ -197,7 +205,10 @@ module TkInstaller
     def discover_all
       log "Starting full dynamic discovery"
 
-      # Libs first — version comes from here
+      # Try to get version from pkg-config first — ldconfig will also set it if needed
+      pkgconfig_version
+
+      # Libs first — version also extracted here if pkg-config didn't get it
       @paths[:tcl_lib]     = locate_lib(TCL_LIB_PATTERN)
       @paths[:tk_lib]      = locate_lib(TK_LIB_PATTERN)
       @paths[:tcl_config]  = locate_file(TCL_CONFIG)
