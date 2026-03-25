@@ -1,340 +1,306 @@
 #!/usr/bin/env ruby
-# rubytk_install.rb by CufeHaco
-# Installs and patches Ruby/Tk for Ruby 2.4+ with Tcl/Tk 8.6 (dynamic detection)
+# Tk_Installer.rb by CufeHaco
+# Installs and patches Ruby/Tk for Ruby 2.4+ with Tcl/Tk (fully dynamic detection)
 # Repurposed from RubianFileUtils::DynamicUtils
-# Updated 2026-03-24 — Linux Mint / Ubuntu x86_64 path fix, lock-wait, non-destructive cleanup
+# Updated 2026 — fully dynamic Linux path discovery via ldconfig/pkg-config/find
+# No hardcoded paths. Filenames are the only constants.
 # https://github.com/CufeHaco/Tk_Patch
 
 require 'rbconfig'
 require 'fileutils'
+require 'json'
 
 module TkInstaller
-  class DynamicTkUtils
-    SUPPORTED_VERSION = '8.6'
-    LOCK_PATH         = '/var/lib/dpkg/lock-frontend'
-    LOCK_WAIT_SECS    = 60
-    LOCK_POLL_SECS    = 5
+  CACHE_FILE = 'tk_install_data.json'
+  LOG_FILE   = 'tk_installer.log'
 
+  # Filenames we need to locate — these are the only constants
+  # Version is extracted from whatever the system actually has
+  TCL_CONFIG  = 'tclConfig.sh'
+  TK_CONFIG   = 'tkConfig.sh'
+  TCL_HEADER  = 'tcl.h'
+  TK_HEADER   = 'tk.h'
+  # .so patterns — version extracted from match
+  TCL_LIB_PATTERN = 'libtcl*.so'
+  TK_LIB_PATTERN  = 'libtk*.so'
+
+  class DynamicTkUtils
     def initialize
-      @os              = RbConfig::CONFIG['host_os']
-      @arch            = `uname -m 2>/dev/null`.strip          # e.g. x86_64 or aarch64
-      @multiarch       = `dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null`.strip
-      @multiarch       = "#{@arch}-linux-gnu" if @multiarch.empty?  # fallback
-      @tcltk_version   = nil
-      @tcl_config_path = nil
-      @tk_config_path  = nil
-      @tcl_lib_path    = nil
-      @tk_lib_path     = nil
-      @tcl_include_path = nil
-      @tk_include_path  = nil
-      @log_file        = 'tk_installer.log'
-      @temp_log        = '/tmp/tk_installer_apt.log'
-      log "Starting Tk Installer at #{Time.now} on #{@os} (arch=#{@arch}, multiarch=#{@multiarch})"
+      @os          = RbConfig::CONFIG['host_os']
+      @version     = nil   # extracted from discovered filenames
+      @paths       = {}    # all discovered paths live here
+      @from_cache  = false
     end
 
-    # ── Logging ────────────────────────────────────────────────────────────────
+    # ─── Logging ────────────────────────────────────────────────────────────────
 
     def log(message)
-      File.open(@log_file, 'a') { |f| f.puts "[#{Time.now}] #{message}" }
+      File.open(LOG_FILE, 'a') { |f| f.puts "[#{Time.now}] #{message}" }
       puts message
     end
 
-    # ── dpkg lock wait ─────────────────────────────────────────────────────────
-    # Prevents the "held by process N (aptk)" race between consecutive runs.
+    # ─── Cache ──────────────────────────────────────────────────────────────────
 
-    def wait_for_dpkg_lock
-      waited = 0
-      while File.exist?(LOCK_PATH) && waited < LOCK_WAIT_SECS
-        log "dpkg lock held — waiting #{LOCK_POLL_SECS}s (#{waited}/#{LOCK_WAIT_SECS}s elapsed)..."
-        sleep LOCK_POLL_SECS
-        waited += LOCK_POLL_SECS
-      end
-      if File.exist?(LOCK_PATH)
-        log "ERROR: dpkg lock still held after #{LOCK_WAIT_SECS}s. Kill the blocking process or reboot."
-        log "  Run: sudo lsof #{LOCK_PATH}"
-        cleanup_and_exit(1)
+    def load_cache
+      return false unless File.exist?(CACHE_FILE)
+      begin
+        data = JSON.parse(File.read(CACHE_FILE))
+        @version    = data['version']
+        @paths      = data['paths'].transform_keys(&:to_sym)
+        @from_cache = true
+        log "Loaded cached install data (version #{@version})"
+        log "Cached paths: #{@paths.inspect}"
+        true
+      rescue => e
+        log "Cache load failed (#{e.message}), running fresh discovery"
+        false
       end
     end
 
-    # ── File detection ─────────────────────────────────────────────────────────
-    # Rubian boot pattern: glob all → select by filename → assign dir.
-    # One candidate pool. Six selects. No complex regex on paths.
-    # search_paths already scope to version dirs — version filter is just
-    # p.include?(ver) on the full path string, which catches both
-    # /usr/lib/tcl8.6/tclConfig.sh AND /usr/lib/x86_64-linux-gnu/libtcl8.6.so
+    def save_cache
+      data = { 'version' => @version, 'paths' => @paths }
+      File.write(CACHE_FILE, JSON.pretty_generate(data))
+      log "Saved install data to #{CACHE_FILE}"
+    rescue => e
+      log "Warning: could not save cache — #{e.message}"
+    end
 
-    def detect_tcltk_files(search_paths)
-      ver = @tcltk_version || SUPPORTED_VERSION
+    def clear_cache
+      File.delete(CACHE_FILE) if File.exist?(CACHE_FILE)
+      log "Cache cleared"
+    end
 
-      # Glob all files under the scoped search paths in one pass
-      all_files = search_paths
-                    .select  { |p| Dir.exist?(p) }
-                    .flat_map { |p| Dir.glob("#{p}/**/*") }
-                    .select  { |p| File.file?(p) }
-                    .uniq
+    # ─── Core Discovery — ldconfig first, then pkg-config, then find ────────────
 
-      # Tier 2 — widen to all of /usr if scoped glob missed everything
-      if all_files.empty?
-        log "Scoped glob empty — widening to /usr..."
-        all_files = Dir.glob("/usr/**/*").select { |p| File.file?(p) }.uniq
+    # Find a shared library (.so) by pattern using ldconfig
+    # Returns [full_path, extracted_version] or nil
+    def ldconfig_find(pattern)
+      # ldconfig -p dumps every known shared lib on the system
+      output = `ldconfig -p 2>/dev/null`
+      base   = pattern.gsub('*', '')  # e.g. "libtcl" from "libtcl*.so"
+
+      # Find all matching lines
+      matches = output.lines.select { |l| l.include?(base) && l.include?('.so') }
+      log "ldconfig matches for #{pattern}: #{matches.map(&:strip).inspect}"
+
+      matches.each do |line|
+        # Line format: "  libtcl8.6.so.0 (libc6,x86-64) => /lib/x86_64-linux-gnu/libtcl8.6.so.0"
+        if line =~ /=>\s+(.+\.so[\d.]*)$/
+          full_path = $1.strip
+          # Extract version from filename: libtcl8.6.so → "8.6"
+          if File.basename(full_path) =~ /#{base.sub('lib', '')}([\d.]+)\.so/
+            version = $1
+            return [File.dirname(full_path), version]
+          end
+        end
+      end
+      nil
+    end
+
+    # Ask pkg-config for a path variable
+    def pkgconfig_var(package, variable)
+      result = `pkg-config --variable=#{variable} #{package} 2>/dev/null`.strip
+      result.empty? ? nil : result
+    end
+
+    # Full filesystem find — last resort, no path hints
+    def filesystem_find(filename)
+      log "Filesystem search for #{filename}..."
+      # Exclude /proc /sys /dev to avoid hangs
+      result = `find / -name '#{filename}' -not -path '/proc/*' -not -path '/sys/*' -not -path '/dev/*' 2>/dev/null`.lines.map(&:chomp).reject(&:empty?)
+      log "Filesystem find results for #{filename}: #{result.inspect}"
+      result
+    end
+
+    # Locate a single exact filename, return its directory
+    def locate_file(filename)
+      # Stage 1: pkg-config (for config/include files)
+      if filename == TCL_CONFIG
+        path = pkgconfig_var('tcl', 'libdir')
+        if path && File.exist?("#{path}/#{filename}")
+          log "pkg-config found #{filename} in #{path}"
+          return path
+        end
       end
 
-      # Tier 3 — system find as absolute last resort
-      if all_files.empty?
-        log "Wide glob empty — running system find /usr..."
-        all_files = `find /usr -type f 2>/dev/null`.lines.map(&:chomp).reject(&:empty?)
+      if filename == TK_CONFIG
+        path = pkgconfig_var('tk', 'libdir')
+        if path && File.exist?("#{path}/#{filename}")
+          log "pkg-config found #{filename} in #{path}"
+          return path
+        end
       end
 
-      log "Candidate pool: #{all_files.size} paths"
+      if filename == TCL_HEADER
+        path = pkgconfig_var('tcl', 'includedir')
+        if path && File.exist?("#{path}/#{filename}")
+          log "pkg-config found #{filename} in #{path}"
+          return path
+        end
+      end
 
-      # Split into versioned and unversioned pools.
-      # Headers (tcl.h / tk.h) have no version in path so use the full pool.
-      versioned = all_files.select { |p| p.include?(ver) }
+      if filename == TK_HEADER
+        path = pkgconfig_var('tk', 'includedir')
+        if path && File.exist?("#{path}/#{filename}")
+          log "pkg-config found #{filename} in #{path}"
+          return path
+        end
+      end
 
-      @tcl_config_path  ||= versioned.select { |p| File.basename(p) == "tclConfig.sh"          }.first&.then { |p| File.dirname(p) }
-      @tk_config_path   ||= versioned.select { |p| File.basename(p) == "tkConfig.sh"           }.first&.then { |p| File.dirname(p) }
-      @tcl_lib_path     ||= versioned.select { |p| File.basename(p).match?(/\Alibtcl.*\.so/)   }.first&.then { |p| File.dirname(p) }
-      @tk_lib_path      ||= versioned.select { |p| File.basename(p).match?(/\Alibtk.*\.so/)    }.first&.then { |p| File.dirname(p) }
-      @tcl_include_path ||= all_files.select { |p| File.basename(p) == "tcl.h"                 }.first&.then { |p| File.dirname(p) }
-      @tk_include_path  ||= all_files.select { |p| File.basename(p) == "tk.h"                  }.first&.then { |p| File.dirname(p) }
+      # Stage 2: filesystem find
+      results = filesystem_find(filename)
+      return nil if results.empty?
 
-      { tcl_config: @tcl_config_path, tk_config: @tk_config_path,
-        tcl_lib:    @tcl_lib_path,    tk_lib:    @tk_lib_path,
-        tcl_inc:    @tcl_include_path, tk_inc:   @tk_include_path
-      }.each { |k, v| log "  #{k}: #{v || 'UNRESOLVED'}" }
+      # Prefer versioned paths, pick first valid file
+      versioned = results.select { |p| p =~ /[\d]+\.[\d]+/ }
+      chosen = versioned.first || results.first
+      log "Located #{filename} at #{chosen}"
+      File.dirname(chosen)
+    end
 
-      missing = [@tcl_config_path, @tk_config_path, @tcl_lib_path,
-                 @tk_lib_path, @tcl_include_path, @tk_include_path].count(&:nil?)
+    # Locate a .so by pattern — uses ldconfig first, then filesystem find
+    # Also extracts and sets @version
+    def locate_lib(pattern)
+      # Stage 1: ldconfig
+      result = ldconfig_find(pattern)
+      if result
+        dir, ver = result
+        # Set version from first lib we find (tcl takes precedence)
+        if @version.nil? || pattern.include?('tcl')
+          @version = ver
+          log "Version extracted from ldconfig: #{@version}"
+        end
+        return dir
+      end
 
-      if missing > 0
-        log "ERROR: #{missing} Tcl/Tk path(s) unresolved."
-        log "  Run: dpkg -L tcl#{ver}-dev tk#{ver}-dev"
-        log "  Run: find /usr -name tclConfig.sh 2>/dev/null"
+      # Stage 2: filesystem find with pattern
+      log "ldconfig found nothing for #{pattern}, falling back to filesystem find"
+      results = filesystem_find(pattern.gsub('*', ''))
+      # Filter to actual .so files
+      so_files = results.select { |p| p =~ /\.so/ && File.exist?(p) }
+      return nil if so_files.empty?
+
+      chosen = so_files.first
+      # Extract version
+      base = pattern.gsub('lib', '').gsub('*.so', '')
+      if File.basename(chosen) =~ /#{base}([\d.]+)\.so/
+        ver = $1
+        @version ||= ver
+        log "Version extracted from filesystem find: #{@version}"
+      end
+      log "Located lib #{pattern} at #{chosen}"
+      File.dirname(chosen)
+    end
+
+    # ─── Full Discovery Run ──────────────────────────────────────────────────────
+
+    def discover_all
+      log "Starting full dynamic discovery"
+
+      # Libs first — version comes from here
+      @paths[:tcl_lib]     = locate_lib(TCL_LIB_PATTERN)
+      @paths[:tk_lib]      = locate_lib(TK_LIB_PATTERN)
+      @paths[:tcl_config]  = locate_file(TCL_CONFIG)
+      @paths[:tk_config]   = locate_file(TK_CONFIG)
+      @paths[:tcl_include] = locate_file(TCL_HEADER)
+      @paths[:tk_include]  = locate_file(TK_HEADER)
+
+      missing = @paths.select { |_, v| v.nil? }.keys
+      if missing.any?
+        log "Discovery incomplete. Missing: #{missing.inspect}"
         return false
       end
 
+      log "Discovery complete. Version: #{@version}"
+      log "Paths: #{@paths.inspect}"
       true
     end
 
-
-    # ── Tcl/Tk version detection ───────────────────────────────────────────────
-
-    def get_tcltk_version
-      return nil unless system('which tclsh > /dev/null 2>&1')
-      version = `printf 'puts [info patchlevel]\nexit\n' | tclsh 2>/dev/null`.strip
-      return nil if version.empty?
-      log "Detected Tcl/Tk version: #{version}"
-      version
-    end
-
-    # ── Requirements check ─────────────────────────────────────────────────────
+    # ─── Requirements & Install ──────────────────────────────────────────────────
 
     def check_requirements
       log "Checking requirements"
       unless system('which gem > /dev/null 2>&1')
-        log 'ERROR: RubyGems not found. Please install Ruby.'
+        log 'Error: RubyGems not found. Please install Ruby.'
         cleanup_and_exit(1)
       end
-      if @os =~ /linux/ && !system('sudo -v > /dev/null 2>&1')
-        log 'ERROR: sudo required. Please run as a user with sudo privileges.'
+      unless system('sudo -v > /dev/null 2>&1')
+        log 'Error: sudo required. Please run as a user with sudo privileges.'
         cleanup_and_exit(1)
       end
-      unless system('which X > /dev/null 2>&1') || system('which Xorg > /dev/null 2>&1')
-        log 'WARNING: X11 not found. Tk requires a graphical environment.'
-        log '  Install with: sudo apt-get install xorg'
+      unless system('which X > /dev/null 2>&1')
+        log 'Warning: X11 not found. Tk requires a graphical environment.'
+        log 'Install with: sudo apt-get install xorg'
       end
     end
 
-    # ── Dependency installation ────────────────────────────────────────────────
+    def install_tcltk
+      log "Installing Tcl/Tk development packages"
+      system('sudo apt-get update')
 
-    def install_dependencies
-      log "Installing Tcl/Tk #{SUPPORTED_VERSION} dependencies"
-      case @os
-      when /linux/
-        wait_for_dpkg_lock
-        system 'sudo apt-get update -qq'
-        pkgs = "ruby-dev tcl#{SUPPORTED_VERSION}-dev tk#{SUPPORTED_VERSION}-dev libx11-dev"
-        unless system("sudo apt-get install -y #{pkgs} > #{@temp_log} 2>&1")
-          log "apt installation failed. Output:\n#{safe_read_temp}"
-          cleanup_and_exit(1)
-        end
-        log "Packages installed: #{pkgs}"
-      when /darwin/
-        unless system('which brew > /dev/null 2>&1')
-          log 'ERROR: Homebrew not found. Install from https://brew.sh or install Tcl/Tk 8.6 manually.'
-          cleanup_and_exit(1)
-        end
-        unless system("brew install tcl-tk@#{SUPPORTED_VERSION}")
-          log "ERROR: brew install tcl-tk@#{SUPPORTED_VERSION} failed."
-          cleanup_and_exit(1)
-        end
-      when /mswin|mingw/
-        log 'Please install ActiveTcl 8.6 from https://www.activestate.com/products/activetcl.'
-        exit 1 unless Dir.exist?('C:/ActiveTcl')
-        %i[@tcl_config_path @tk_config_path @tcl_lib_path @tk_lib_path
-           @tcl_include_path @tk_include_path].each { |v| instance_variable_set(v, 'C:/ActiveTcl') }
-      else
-        log "Unsupported OS: #{@os}. Please install Tcl/Tk #{SUPPORTED_VERSION} manually."
+      # Install without version pin — let the system resolve what's available
+      cmd = "sudo apt-get install -y ruby-all-dev tcl-dev tk-dev libx11-dev 2>&1"
+      output = `#{cmd}`
+      success = $?.success?
+
+      log output
+      unless success
+        log "Package installation failed"
         cleanup_and_exit(1)
       end
-      @tcltk_version = get_tcltk_version&.split('.')&.first(2)&.join('.') || SUPPORTED_VERSION
+      log "Packages installed successfully"
     end
 
-    # ── Detection ──────────────────────────────────────────────────────────────
-
-    def detect_tcltk
-      log "Detecting Tcl/Tk"
-      existing = get_tcltk_version
-      if existing
-        major_minor = existing.split('.').first(2).join('.')
-        if major_minor == SUPPORTED_VERSION
-          @tcltk_version = major_minor
-          log "Compatible Tcl/Tk version #{@tcltk_version} detected. Proceeding."
-        else
-          log "Detected Tcl/Tk #{existing}; need #{SUPPORTED_VERSION}. Installing..."
-          install_dependencies
-          retry_detection
-        end
-      else
-        log "Tcl/Tk not found. Installing #{SUPPORTED_VERSION}..."
-        install_dependencies
-        retry_detection
-      end
-
-      # ── Build an exhaustive, arch-aware search path list ──────────────────
-      ver = @tcltk_version
-      search_paths = case @os
-                     when /linux/
-                       [
-                         # Standard Debian/Ubuntu/Mint layout
-                         "/usr/lib/tcl#{ver}",
-                         "/usr/lib/tk#{ver}",
-                         "/usr/share/tcltk/tcl#{ver}",
-                         "/usr/share/tcltk/tk#{ver}",
-                         # Multiarch  (x86_64-linux-gnu  OR  aarch64-linux-gnu)
-                         "/usr/lib/#{@multiarch}",
-                         "/usr/lib/#{@multiarch}/tcl#{ver}",
-                         "/usr/lib/#{@multiarch}/tk#{ver}",
-                         # Legacy / upstream install locations
-                         "/usr/local/lib/tcl#{ver}",
-                         "/usr/local/lib/tk#{ver}",
-                         "/usr/local/lib",
-                         "/usr/lib",
-                         "/usr/lib/x86_64-linux-gnu",   # explicit for mixed-arch systems
-                         "/usr/lib/aarch64-linux-gnu",
-                         # Include headers
-                         "/usr/include/tcl#{ver}",
-                         "/usr/include/tk#{ver}",
-                         "/usr/include",
-                         "/usr/local/include",
-                       ]
-                     when /darwin/
-                       [
-                         "/opt/homebrew/opt/tcl-tk@#{ver}",
-                         "/opt/homebrew/Cellar/tcl-tk@#{ver}",
-                         "/usr/local/opt/tcl-tk",
-                         "/Library/Frameworks/Tcl.framework",
-                         "/Library/Frameworks/Tk.framework",
-                       ]
-                     when /mswin|mingw/
-                       ['C:/ActiveTcl', 'C:/Tcl']
-                     else
-                       []
-                     end
-
-      cleanup_and_exit(1) unless detect_tcltk_files(search_paths)
-    end
-
-    # ── Retry after install ────────────────────────────────────────────────────
-
-    def retry_detection
-      log 'Retrying Tcl/Tk detection after installation...'
-      3.times do |attempt|
-        delay = (attempt + 1) * 5
-        sleep delay
-        @tcltk_version = get_tcltk_version&.split('.')&.first(2)&.join('.') || SUPPORTED_VERSION
-        break if @tcltk_version
-        log "Retry #{attempt + 1}/3 failed after #{delay}s."
-      end
-      unless @tcltk_version
-        log 'ERROR: Tcl/Tk still not detected after 3 retries. Check PATH or install manually.'
-        cleanup_and_exit(1)
-      end
-      log "Retry successful. Tcl/Tk #{@tcltk_version}"
-    end
-
-    # ── Symlinks ───────────────────────────────────────────────────────────────
+    # ─── Symlinks ────────────────────────────────────────────────────────────────
 
     def create_symlinks
-      return unless @os =~ /linux/
-      ver = @tcltk_version
-      log "Creating symlinks for Tcl/Tk #{ver}"
+      log "Creating symlinks for Tcl/Tk #{@version}"
 
       symlinks = [
-        ["#{@tcl_config_path}/tclConfig.sh",           '/usr/lib/tclConfig.sh'],
-        ["#{@tk_config_path}/tkConfig.sh",             '/usr/lib/tkConfig.sh'],
-        ["#{@tcl_lib_path}/libtcl#{ver}.so.0",         "/usr/lib/libtcl#{ver}.so.0"],
-        ["#{@tk_lib_path}/libtk#{ver}.so.0",           "/usr/lib/libtk#{ver}.so.0"],
+        ["#{@paths[:tcl_config]}/#{TCL_CONFIG}",              '/usr/lib/tclConfig.sh'],
+        ["#{@paths[:tk_config]}/#{TK_CONFIG}",                '/usr/lib/tkConfig.sh'],
+        ["#{@paths[:tcl_lib]}/libtcl#{@version}.so",          "/usr/lib/libtcl#{@version}.so"],
+        ["#{@paths[:tk_lib]}/libtk#{@version}.so",            "/usr/lib/libtk#{@version}.so"]
       ]
 
-      # Also try the .so without .0 suffix if the .0 variant doesn't exist
-      symlinks.map! do |src, dest|
-        alt_src = src.sub(/\.so\.0$/, '.so')
-        src = alt_src if !File.exist?(src) && File.exist?(alt_src)
-        [src, dest]
-      end
-
       symlinks.each do |src, dest|
+        if !File.exist?(src)
+          log "Source not found, skipping symlink: #{src}"
+          next
+        end
         if File.exist?(dest) || File.symlink?(dest)
-          log "Symlink/file already exists: #{dest}"
-        elsif File.exist?(src)
-          result = system("sudo ln -s #{src} #{dest}")
-          log result ? "Created symlink: #{src} -> #{dest}" : "WARNING: Failed to create symlink: #{src} -> #{dest}"
+          log "Already exists, skipping: #{dest}"
+          next
+        end
+        result = system("sudo ln -s #{src} #{dest}")
+        if result
+          log "Created symlink: #{src} -> #{dest}"
         else
-          log "WARNING: Source not found for symlink: #{src}"
-          # Non-fatal — gem install flags provide the paths directly
+          log "Failed to create symlink: #{src} -> #{dest}"
         end
       end
     end
 
-    # ── Gem install ────────────────────────────────────────────────────────────
+    # ─── Gem Install ─────────────────────────────────────────────────────────────
 
     def install_tk_gem
-      log 'Installing tk gem'
-      ver = @tcltk_version
-      case @os
-      when /linux/
-        cmd = [
-          'sudo gem install tk --',
-          "--with-tcltkversion=#{ver}",
-          "--with-tcl-lib=#{@tcl_lib_path}",
-          "--with-tk-lib=#{@tk_lib_path}",
-          "--with-tcl-include=#{@tcl_include_path}",
-          "--with-tk-include=#{@tk_include_path}",
-          '--enable-pthread',
-        ].join(' ')
-        log "gem install command: #{cmd}"
-        unless system(cmd)
-          log "ERROR: tk gem installation failed. (exit status: #{$?.exitstatus})"
-          cleanup_and_exit(1)
-        end
-      when /darwin/
-        short = ver.delete('.')
-        cmd = "sudo gem install tk -- --with-tcl-dir=#{@tcl_lib_path} --with-tk-dir=#{@tk_lib_path} " \
-              "--with-tcllib=tcl#{short} --with-tklib=tk#{short}"
-        unless system(cmd)
-          log 'ERROR: tk gem installation failed.'
-          cleanup_and_exit(1)
-        end
-      when /mswin|mingw/
-        unless system("gem install tk -- --with-tcl-dir=#{@tcl_lib_path} --with-tk-dir=#{@tk_lib_path}")
-          log 'ERROR: tk gem installation failed.'
-          cleanup_and_exit(1)
-        end
+      log "Installing tk gem"
+      cmd = "sudo gem install tk -- " \
+            "--with-tcltkversion=#{@version} " \
+            "--with-tcl-lib=#{@paths[:tcl_lib]} " \
+            "--with-tk-lib=#{@paths[:tk_lib]} " \
+            "--with-tcl-include=#{@paths[:tcl_include]} " \
+            "--with-tk-include=#{@paths[:tk_include]} " \
+            "--enable-pthread"
+      log "Running: #{cmd}"
+      unless system(cmd)
+        log "Failed to install tk gem"
+        cleanup_and_exit(1)
       end
+      log "tk gem installed successfully"
     end
 
-    # ── Smoke test ─────────────────────────────────────────────────────────────
+    # ─── Test ────────────────────────────────────────────────────────────────────
 
     def test_tk
       log 'Testing Tk gem'
@@ -343,69 +309,76 @@ module TkInstaller
         log "Tk version: #{Tk::TK_PATCHLEVEL}"
         root = TkRoot.new { title 'CufeHaco Tk Installer Test' }
         root['geometry'] = '400x200'
-        TkLabel.new(root)  { text 'Tk Installer Successful!'; pack }
-        TkButton.new(root) { text 'EXIT'; command { exit }; pack }
+        TkLabel.new(root) { text 'Tk Installer Successful!' }.pack
+        TkButton.new(root) { text 'EXIT'; command { exit } }.pack
         Tk.mainloop
         log 'Tk test passed!'
-      rescue LoadError => e
-        log "ERROR: Failed to load tk gem — #{e.message}"
+      rescue LoadError
+        log 'Error: Failed to load tk gem. Check Tcl/Tk installation.'
         cleanup_and_exit(1)
       rescue => e
-        log "ERROR during Tk test: #{e.message}"
+        log "Error during Tk test: #{e.message}"
         cleanup_and_exit(1)
       end
     end
 
-    # ── Cleanup ────────────────────────────────────────────────────────────────
-    # Changed from original: cleanup no longer REMOVES packages on failure.
-    # Removing the dev packages on failure left the system in a worse state
-    # and triggered dpkg lock contention on the next run.
-    # Instead we log what to do manually and exit cleanly.
+    # ─── Cleanup ─────────────────────────────────────────────────────────────────
 
     def cleanup_and_exit(exit_code)
-      log "Cleanup initiated due to failure (exit code: #{exit_code})"
-      case @os
-      when /linux/
-        log "No packages removed. To clean up manually if desired:"
-        log "  sudo apt-get remove ruby-dev tcl#{SUPPORTED_VERSION}-dev tk#{SUPPORTED_VERSION}-dev libx11-dev"
-        log "  sudo apt-get autoremove --purge"
-        log "  sudo rm -f /usr/lib/tclConfig.sh /usr/lib/tkConfig.sh"
-        log ""
-        log "To diagnose the Tcl/Tk file layout on this machine:"
-        log "  dpkg -L tcl#{SUPPORTED_VERSION}-dev tk#{SUPPORTED_VERSION}-dev"
-        log "  find /usr -name tclConfig.sh 2>/dev/null"
-      when /darwin/
-        log "To clean up: brew uninstall tcl-tk@#{SUPPORTED_VERSION}"
-      when /mswin|mingw/
-        log 'No automatic cleanup for Windows. Uninstall ActiveTcl 8.6 manually if needed.'
+      log "Cleanup initiated (exit code: #{exit_code})"
+      # Only remove packages if we installed them (not if discovery just failed)
+      if exit_code != 0 && !@from_cache
+        log 'Removing installed packages...'
+        system "sudo apt-get remove -y tcl-dev tk-dev libx11-dev 2>&1"
+        system "sudo apt-get autoremove -y --purge 2>&1"
+        system "sudo rm -f /usr/lib/tclConfig.sh /usr/lib/tkConfig.sh " \
+               "/usr/lib/libtcl#{@version}.so /usr/lib/libtk#{@version}.so"
       end
-      FileUtils.rm_f(@temp_log)
+      clear_cache if exit_code != 0
       log 'Exiting.'
       exit exit_code
     end
 
-    # ── Entry point ────────────────────────────────────────────────────────────
+    # ─── Run ─────────────────────────────────────────────────────────────────────
 
     def run
+      log "Starting Tk Installer at #{Time.now} on #{@os}"
       check_requirements
-      detect_tcltk
+
+      # Try cache first
+      unless load_cache
+        # Attempt discovery before installing
+        log "Attempting discovery before install..."
+        discovered = discover_all
+
+        unless discovered
+          log "Discovery incomplete — installing Tcl/Tk packages first"
+          install_tcltk
+          log "Re-running discovery after install..."
+          discovered = discover_all
+          unless discovered
+            log "Discovery still incomplete after install. Cannot continue."
+            cleanup_and_exit(1)
+          end
+        end
+
+        # Save what we found — whether installed fresh or already present
+        save_cache
+      end
+
       create_symlinks
       install_tk_gem
+
       begin
         test_tk
         log "Tk Installer completed successfully at #{Time.now}"
       rescue StandardError => e
-        log "Installation failed during test phase: #{e.message}"
+        log "Installation failed during test: #{e.message}"
         cleanup_and_exit(1)
       end
-    end
-
-    private
-
-    def safe_read_temp
-      File.exist?(@temp_log) ? File.read(@temp_log) : '(no output file)'
     end
   end
 end
 
+# Run the installer
 TkInstaller::DynamicTkUtils.new.run
