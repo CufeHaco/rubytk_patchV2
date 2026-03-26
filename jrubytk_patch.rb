@@ -110,7 +110,7 @@ module TkJRubyBridge
     # jruby_sockets.rb becomes part of socket — just require 'socket' after this.
 
     def install_jep380
-      if Dir.exist?(JEP380_DIR) && File.exist?("#{JEP380_DIR}/jruby_sockets.rb")
+      if Dir.exist?(JEP380_DIR) && File.exist?("#{JEP380_DIR}/lib/jruby_sockets.rb")
         log "JEP-380 already installed at #{JEP380_DIR}"
         require_jep380
         return
@@ -123,15 +123,14 @@ module TkJRubyBridge
         cleanup_and_exit(1)
       end
 
-      # Clone branch to permanent location
       system("sudo mkdir -p #{JEP380_DIR}")
       unless system("sudo git clone -b #{JEP380_BRANCH} #{JEP380_REPO} #{JEP380_DIR} 2>&1")
         log "Error: Failed to clone JEP-380 repo"
         cleanup_and_exit(1)
       end
 
-      unless File.exist?("#{JEP380_DIR}/jruby_sockets.rb")
-        log "Error: jruby_sockets.rb not found in cloned repo"
+      unless File.exist?("#{JEP380_DIR}/lib/jruby_sockets.rb")
+        log "Error: jruby_sockets.rb not found in cloned repo at #{JEP380_DIR}/lib/"
         cleanup_and_exit(1)
       end
 
@@ -143,7 +142,7 @@ module TkJRubyBridge
       # require 'socket' first — JEP-380 builds on top of it
       require 'socket'
       # jruby_sockets becomes part of socket on the JRuby side
-      require "#{JEP380_DIR}/jruby_sockets"
+      require "#{JEP380_DIR}/lib/jruby_sockets"
       log "JRubySockets loaded (version #{JRubySockets::VERSION})"
     end
 
@@ -349,24 +348,22 @@ module TkJRubyBridge
       @cruby_pid = @cruby_io.gets.to_i  # blocks until CRuby signals ready
       log "CRuby subprocess running (pid #{@cruby_pid})"
 
-      # JRubySockets::Client handles retries and stale socket cleanup automatically
-      # This is just require 'socket' — JEP-380 is already underneath
+      # JRubySockets::Client — auto-reconnect, stale cleanup, signal handling
+      # This is just require 'socket' — JEP-380 is already underneath on JRuby
       log "Connecting via JRubySockets::Client (JEP-380 UDS)"
       @client = JRubySockets::Client.new(SOCKET_PATH, auto_reconnect: true, max_retries: 5)
       log "JEP-380 UDS connection established: #{SOCKET_PATH}"
     end
 
     # ─── Tcl Dispatch — 4-byte length prefix framing ─────────────────────────────
-    # JRubySockets handles the socket I/O. We own the framing protocol.
+    # JRubySockets handles socket I/O. We own the framing protocol.
     # Same 4-byte big-endian length prefix as Kestówv IPC.
 
     def send_tcl(cmd)
-      bytes = cmd.encode('UTF-8')
-      # Frame: 4-byte length prefix + command bytes
+      bytes  = cmd.encode('UTF-8')
       framed = [bytes.bytesize].pack('N') + bytes
       @client.send(framed)
 
-      # Read framed response
       response = @client.recv(8192)
       return nil if response.nil? || response.bytesize < 4
       length = response[0, 4].unpack1('N')
@@ -416,7 +413,7 @@ module TkJRubyBridge
       log "Starting Tk JRuby Bridge at #{Time.now} on #{@os}"
       check_requirements
 
-      # Install JEP-380 — clones repo, loads jruby_sockets into socket
+      # Clone JEP-380 full-prototype branch, load jruby_sockets into socket
       install_jep380
 
       unless load_cache
